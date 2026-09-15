@@ -26,6 +26,7 @@ from omegaconf import DictConfig, OmegaConf
 # 解析成字符串，这里统一转回正确的数值类型。
 _FLOAT_FIELDS = {"lr", "wd", "beta1", "beta2", "eps", "grad_clip_norm"}
 _INT_FIELDS = {"image_size", "workers", "batch_size", "accumulate_steps",
+               "keep_last_n",
                "epochs", "warmup", "save_freq", "log_every", "seed"}
 
 

@@ -36,6 +36,7 @@ all_gather 时会因 tensor 形状不同而报错甚至死锁。
 import json
 import os
 import random
+import re
 
 import torch
 from PIL import Image
@@ -53,6 +54,27 @@ _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 # coco_flat 格式的文件后缀。
 _IMAGE_SUFFIX = ".jpg"
 _CAPTION_SUFFIX = ".txt"
+
+# 源数据里混进了少量「字面转义序列」的脏标注：本该是换行的地方被写成了两个
+# 字符 —— 反斜杠 + n，而不是真正的换行符（xxd 看到的是 5c 6e）。
+# 实测 train 有 2213/591753 条（0.37%）命中，其中绝大多数只是结尾多一个 \n；
+# 但 s0008172 那条把 \n 重复了 43 次，BPE 后 102 个 token，直接超过 CLIP 的
+# 77 上下文长度，让 clip.tokenize 抛 "is too long for context length 77"。
+# 要命的是它只在被随机抽到时才触发 —— 实测跑到第 11 个 epoch 才抽中，
+# 一崩就是整轮多卡训练全废。这里在读取时把转义序列还原成空格。
+_ESCAPE_RE = re.compile(r"\\[nrt]")
+
+
+def _clean_caption(text: str) -> str:
+    """去掉混进标注里的字面转义序列（``\\n`` / ``\\r`` / ``\\t``）。
+
+    只在真的含反斜杠时才走正则 —— 99.6% 的 caption 不命中这条分支，开销可忽略。
+    命中时把转义序列换成空格并折叠连续空白，从而还原出标注者本意的那句话
+    （例：``"...rain to come.\\n\\n\\n"`` → ``"...rain to come."``）。
+    """
+    if "\\" not in text:
+        return text.strip()
+    return re.sub(r"\s+", " ", _ESCAPE_RE.sub(" ", text)).strip()
 
 
 class ImageTextDataset(Dataset):
@@ -86,8 +108,9 @@ class ImageTextDataset(Dataset):
         # 统一转为 RGB（PNG 可能是 RGBA / 灰度）
         image = Image.open(image_path).convert("RGB")
         image = self.transform(image)
-        # tokenize 返回 shape [1, context_length] 的 int tensor，取 [0] 得到一维
-        text = self.tokenizer(caption)[0]
+        # tokenize 返回 shape [1, context_length] 的 int tensor，取 [0] 得到一维。
+        # truncate=True：超长 caption 截断而不是抛异常，避免一条脏数据崩掉整轮训练。
+        text = self.tokenizer(caption, truncate=True)[0]
         return image, text
 
 
@@ -167,7 +190,7 @@ class CocoFlatDataset(Dataset):
         # 这些 .txt 文件末尾没有换行符（wc -l 会少算一行），用 split("\n") 读全。
         # errors="replace" 防止个别脏字节中断整个训练。
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            captions = [line.strip() for line in f.read().split("\n")]
+            captions = [_clean_caption(line) for line in f.read().split("\n")]
         captions = [c for c in captions if c]
         # 兜底：文件异常为空时返回空串，tokenize("") 至少能产出 [SOT, EOT]
         return captions or [""]
@@ -187,7 +210,9 @@ class CocoFlatDataset(Dataset):
         # 不同 caption。若按 idx 定种，(图片, caption) 就成了 idx 的固定函数，
         # 每个 epoch 都取到同一句，随机增强的效果就没了。
         caption = random.choice(self.read_captions(idx))
-        text = self.tokenizer(caption)[0]
+        # truncate=True 是兜底：清洗过后全量数据已无超长 caption，但万一以后
+        # 换数据又混进脏样本，宁可截断也不该让整轮多卡训练中途崩掉。
+        text = self.tokenizer(caption, truncate=True)[0]
         return image, text
 
 
@@ -205,6 +230,29 @@ def get_train_transform(image_size: int) -> transforms.Compose:
                 scale=(0.9, 1.0),
                 interpolation=transforms.InterpolationMode.BICUBIC,
             ),
+            transforms.ToTensor(),
+            transforms.Normalize(_CLIP_MEAN, _CLIP_STD),
+        ]
+    )
+
+
+def get_eval_transform(image_size: int = 224) -> transforms.Compose:
+    """CLIP **评测/推理**用的图像预处理：短边缩放 + 中心裁剪。
+
+    必须和 ``get_train_transform`` 分开，不能混用：
+      * 训练用 ``RandomResizedCrop``（随机裁剪增强），同一张图每次结果都不同；
+      * 评测必须确定性 —— 否则同一张图跑两次得到的类别都可能不一样，
+        而且和官方 CLIP 的评测口径对不上。
+
+    这套 Resize + CenterCrop 就是官方 ``clip.clip._transform`` 的做法。
+    ``interpolation=BICUBIC`` 也是跟官方保持一致（torchvision 的 Resize 默认是 BILINEAR）。
+    """
+    return transforms.Compose(
+        [
+            transforms.Resize(
+                image_size, interpolation=transforms.InterpolationMode.BICUBIC
+            ),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
             transforms.Normalize(_CLIP_MEAN, _CLIP_STD),
         ]

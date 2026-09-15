@@ -29,7 +29,8 @@ import time
 import hydra
 import torch
 import torch.nn.utils as torch_nn_utils
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
 # 把仓库根目录加入 sys.path：
 # 用 `torchrun train/main.py` 启动时，Python 只会把脚本所在目录（train/）加入
@@ -79,8 +80,11 @@ def main(cfg: DictConfig):
     optimizer = train_optim.create_optimizer(model, args)
 
     # 4) AMP：GradScaler 用于混合精度下防止梯度下溢
+    #    用 torch.amp.GradScaler("cuda", ...) 这种新写法：torch>=2.4 起
+    #    torch.cuda.amp.GradScaler 已废弃，torch 2.6 下每次运行都会刷
+    #    FutureWarning 到 stderr，把训练日志冲得很难看。
     use_amp = (not args.no_amp) and torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # 5) 断点续训：加载 checkpoint（在 DDP 包装之前，避免 "module." 前缀问题）
     start_epoch = 0
@@ -116,23 +120,36 @@ def main(cfg: DictConfig):
     # 梯度累积后的有效 batch（与原论文 32768 对齐）
     effective_batch = world_size * args.batch_size * args.accumulate_steps
 
+    summary_lines = [
+        f"model            : {args.model}",
+        f"data_format      : {args.data_format}",
+        f"data             : {args.data_root or args.data_manifest}",
+        f"world_size       : {world_size}",
+        f"batch/GPU        : {args.batch_size}",
+        f"accumulate_steps : {args.accumulate_steps}",
+        f"effective_batch  : {effective_batch}",
+        f"dataset size     : {len(dataset)}",
+        f"batches/epoch    : {num_batches_per_epoch}",
+        f"steps/epoch      : {steps_per_epoch}",
+        f"total_steps      : {total_steps}",
+        f"AMP              : {use_amp}",
+    ]
     if dist_utils.is_main_process():
         print("=" * 60)
-        print(f"model            : {args.model}")
-        print(f"data_format      : {args.data_format}")
-        print(f"data             : {args.data_root or args.data_manifest}")
-        print(f"world_size       : {world_size}")
-        print(f"batch/GPU        : {args.batch_size}")
-        print(f"accumulate_steps : {args.accumulate_steps}")
-        print(f"effective_batch  : {effective_batch}")
-        print(f"dataset size     : {len(dataset)}")
-        print(f"batches/epoch    : {num_batches_per_epoch}")
-        print(f"steps/epoch      : {steps_per_epoch}")
-        print(f"total_steps      : {total_steps}")
-        print(f"AMP              : {use_amp}")
+        for line in summary_lines:
+            print(line)
         print("=" * 60)
 
-    # 8) 训练循环
+    # 9) 训练日志：train.log（人类可读）+ metrics.csv（可直接画曲线）
+    #    只在主进程真正写文件，其余 rank 得到一个空操作的 logger
+    logger = train_utils.TrainLogger(
+        args.output_dir, enabled=dist_utils.is_main_process()
+    )
+    logger.log_run_header(
+        OmegaConf.to_yaml(cfg, resolve=True), summary_lines, resume=args.resume
+    )
+
+    # 10) 训练循环
     model.train()
     for epoch in range(start_epoch, args.epochs):
         # 每个 epoch 重新洗牌，保证各卡采样顺序不同且随机（分布式关键）
@@ -152,17 +169,29 @@ def main(cfg: DictConfig):
             use_amp=use_amp,
             rank=rank,
             world_size=world_size,
+            logger=logger,
         )
 
         # 定期保存 checkpoint（仅主进程）
-        if dist_utils.is_main_process() and (epoch + 1) % args.save_freq == 0:
-            os.makedirs(args.output_dir, exist_ok=True)
+        # 最后一个 epoch 无条件保存：否则当 epochs 不是 save_freq 的整数倍时
+        # （例 epochs=30 + save_freq=8 → 只在 8/16/24 存），训练跑完却拿不到
+        # 最终模型，前面全白训。当前 32 % 8 == 0 恰好命中，但改 epochs 就会踩。
+        is_final_epoch = (epoch + 1) == args.epochs
+        if (dist_utils.is_main_process()
+                and ((epoch + 1) % args.save_freq == 0 or is_final_epoch)):
             ckpt_path = os.path.join(args.output_dir, f"checkpoint_ep{epoch + 1}.pt")
             # 保存前先取回原始模型（去掉 DDP 包装）
             train_utils.save_checkpoint(
                 args, model, optimizer, scaler, epoch, global_step, ckpt_path
             )
+            # save_checkpoint 自己会打印到控制台，这里只补一条文件记录，避免重复刷屏
+            logger.log_message(
+                f"[checkpoint] saved to {ckpt_path} "
+                f"(epoch={epoch}, step={global_step})"
+            )
 
+    logger.log_message("Training finished.")
+    logger.close()
     dist_utils.cleanup()
     if dist_utils.is_main_process():
         print("Training finished.")
@@ -170,12 +199,42 @@ def main(cfg: DictConfig):
 
 def train_one_epoch(
     model, loader, optimizer, scaler, device, args, epoch, global_step,
-    total_steps, use_amp, rank, world_size,
+    total_steps, use_amp, rank, world_size, logger,
 ):
-    """训练一个 epoch，返回 (epoch 平均 loss, 更新后的 global_step)。"""
-    running_loss = 0.0
-    running_count = 0
+    """训练一个 epoch，返回 (该 epoch 的全局平均 loss, 更新后的 global_step)。"""
+    is_main = dist_utils.is_main_process()
+
+    # 两个累加器，职责不同，不要混用：
+    #   window_*  只统计「距上次打日志以来」的窗口，用于实时展示；
+    #   epoch_*   统计整个 epoch（不被打日志重置），用于 epoch 结束时的真实平均 loss。
+    # 旧实现只有一个累加器且在打日志时清零，于是 epoch 末尾算出的「平均」其实
+    # 只是「最后一次打日志之后的平均」，并不是整个 epoch 的。
+    window_loss, window_count = 0.0, 0
+    epoch_loss_sum, epoch_count = 0.0, 0
+
+    # 吞吐统计的「窗口」：只数距上次打日志以来处理了多少样本、过了多久。
+    # 不能拿全局 global_step 除以「本 epoch 已耗时」—— 分母每换一个 epoch 就归零，
+    # 分子却是跨 epoch 的累计值，于是每个 epoch 开头都会飙出一个假的高吞吐
+    # （实测 1980 samples/s → 161110 samples/s，这种数字会误导对瓶颈的判断）。
+    window_samples = 0
+    last_log_time = time.time()
+
+    # 兜底：若循环体一次都没执行（空 loader），lr 也不会是未定义变量
+    lr = optimizer.param_groups[0]["lr"]
     epoch_start = time.time()
+
+    # 进度条只在主进程渲染（其余 rank disable=True，既不输出也不做终端控制）
+    # leave=False：每个 epoch 结束后进度条自行消失，只留下下面那行 epoch 汇总，
+    # 避免 32 个 epoch 的进度条在终端里堆成一片。
+    bar = tqdm(
+        total=len(loader),
+        desc=f"epoch {epoch}",
+        disable=not is_main,
+        leave=False,
+        dynamic_ncols=True,
+        unit="batch",
+        mininterval=0.5,
+    )
 
     for step, (images, texts) in enumerate(loader):
         # non_blocking=True：配合 pin_memory，让数据搬运与计算重叠
@@ -183,7 +242,7 @@ def train_one_epoch(
         texts = texts.to(device, non_blocking=True)
 
         # ---- 混合精度前向 ----
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             image_features, text_features, logit_scale = model(images, texts)
             loss = train_loss.clip_loss(
                 image_features,
@@ -200,8 +259,11 @@ def train_one_epoch(
         scaler.scale(loss).backward()
 
         # 记录 loss（乘回 accumulate_steps 得到真实单步 loss）
-        running_loss += loss.item() * args.accumulate_steps
-        running_count += 1
+        step_loss = loss.item() * args.accumulate_steps
+        window_loss += step_loss
+        window_count += 1
+        epoch_loss_sum += step_loss
+        epoch_count += 1
 
         # ---- 每 accumulate_steps 步更新一次参数 ----
         if (step + 1) % args.accumulate_steps == 0:
@@ -222,25 +284,47 @@ def train_one_epoch(
                 optimizer, global_step, args, total_steps
             )
             global_step += 1
+            window_samples += world_size * args.batch_size * args.accumulate_steps
 
-            # ---- 打印日志（仅主进程，loss 跨卡求平均）----
-            if dist_utils.is_main_process() and global_step % args.log_every == 0:
-                avg_loss = running_loss / running_count
-                # 汇总所有卡的 loss，得到全局 batch 上的真实平均 loss
+            if global_step % args.log_every == 0:
+                # 注意：all_reduce 是集合通信，每个 rank 都必须调用。
+                # 这里绝不能写成 `if is_main and ...:` —— 那样只有 rank 0 进入
+                # 通信，其余 rank 直接跳过，rank 0 会在 all_reduce 上永久阻塞
+                # 直到 NCCL 超时。多卡训练里「日志相关的 hang」基本都是这个原因。
                 global_avg_loss = dist_utils.all_reduce_mean(
-                    torch.tensor(avg_loss, device=device)
+                    torch.tensor(window_loss / max(1, window_count), device=device)
                 )
-                speed = (global_step * world_size * args.batch_size *
-                         args.accumulate_steps) / (time.time() - epoch_start)
-                print(
-                    f"[ep {epoch}][step {global_step}/{total_steps}] "
-                    f"loss={global_avg_loss:.4f} lr={lr:.2e} "
-                    f"samples/s={speed:.1f}"
-                )
-                running_loss = 0.0
-                running_count = 0
+                now = time.time()
+                speed = window_samples / max(now - last_log_time, 1e-9)
 
-    epoch_avg_loss = running_loss / max(1, running_count)
+                # log_step 只写文件/CSV；控制台交给进度条（print 会把进度条冲乱）
+                logger.log_step(epoch, global_step, total_steps,
+                                global_avg_loss, lr, speed)
+                if is_main:
+                    bar.set_postfix(loss=f"{global_avg_loss:.4f}",
+                                    lr=f"{lr:.2e}",
+                                    sps=f"{speed:.0f}")
+
+                window_loss, window_count = 0.0, 0
+                window_samples = 0
+                last_log_time = now
+
+        bar.update(1)
+
+    bar.close()
+
+    # epoch 平均 loss：先算本卡均值，再跨卡取平均。
+    # 各卡 batch 数相等（DistributedSampler + drop_last 保证），所以「均值的均值」
+    # 就是全局均值，不需要额外按样本数加权。
+    epoch_avg_loss = dist_utils.all_reduce_mean(
+        torch.tensor(epoch_loss_sum / max(1, epoch_count), device=device)
+    )
+
+    epoch_elapsed = time.time() - epoch_start
+    samples_per_epoch = epoch_count * world_size * args.batch_size * args.accumulate_steps
+    logger.log_epoch(epoch, epoch_avg_loss,
+                     samples_per_epoch / max(epoch_elapsed, 1e-9),
+                     epoch_elapsed, lr)
     return epoch_avg_loss, global_step
 
 

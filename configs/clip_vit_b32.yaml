@@ -1,13 +1,21 @@
 # ============================================================================
-# CLIP 训练配置示例（ViT-B/32，对齐原论文）
+# CLIP 训练配置（ViT-B/32）—— 已按「2 卡 + COCO 2017 118K 图文对」重新标定
 #
 # 由 Hydra 加载：main.py 里 @hydra.main(config_name="clip_vit_b32")
 #
 # 命令行覆盖用 key=value 语法（注意没有 -- 前缀），例如临时改 batch / lr：
-#     torchrun --nproc_per_node=8 train/main.py \
-#         batch_size=128 lr=1e-4 data_manifest=/path/to/train.jsonl
+#     torchrun --nproc_per_node=2 train/main.py \
+#         batch_size=128 lr=1e-4 data_root=/path/to/dataset
 #
-# 有效 batch = world_size(8) * batch_size(256) * accumulate_steps(16) = 32768
+# 本数据集规模与超参推导（详见文件内各字段处的注释）：
+#   训练集 118,287 张  →  drop_last 后每卡 118287 // 2 = 59,143 张
+#   每卡每 epoch 59,143 // 256 = 231 个 batch
+#   accumulate_steps = 1  →  231 个优化步/epoch，32 epoch 共 ≈ 7,392 步
+#   有效 batch = world_size(2) × batch_size(256) × accumulate_steps(1) = 512
+#
+# 注意：原论文的 batch=32768 / lr=5e-4 是针对 4 亿图文对的预训练配方，
+# 直接套到 11.8 万张图上会让「总优化步数 < warmup 步数」，学习率全程停在
+# warmup 里等于没训。下面每个字段都按本数据集的规模做了相应调整。
 # ============================================================================
 
 # ---- Hydra 运行时设置 ----
@@ -26,30 +34,52 @@ data_format: null
 data_manifest: null        # data_format=manifest 时必填，例：/path/to/train.jsonl
 data_root: null            # 例：/root/autodl-tmp/wds_mscoco_captions2017
 image_size: 224
-# 注意：本机 nproc=1（cgroup 配额 0.5 核），8 个 rank × workers 个进程共享 1 核，
-# 设太大会造成进程争抢，反而变慢。
-workers: 2
+# 2 个 rank × 8 = 16 个读图进程，本机有 32 核，足够。
+# 数据加载是这里最可能的瓶颈：每 epoch 要解码约 19GB JPEG，若 samples/s 上不去
+# 优先调这个值（而不是调大 batch）。
+workers: 8
 
 # ---- 优化 ----
-batch_size: 256
-accumulate_steps: 16       # 与原论文 batch=32768 对齐（8 卡时）
-epochs: 32
-lr: 5.0e-4                 # 建议带小数点的科学计数法，避免被 YAML 解析成字符串
-warmup: 2000
+batch_size: 256            # 单卡 batch。RTX 4090 24GB 上 ViT-B/32@224 + AMP 约用 8~10GB
+# 梯度累积：这里必须设 1，不能沿用原论文配方的 16。
+#   设 16 时：每卡 231 个 batch → 231 // 16 = 14 个优化步/epoch → 32 epoch 仅 448 步。
+#   更重要的是，本仓库的对比损失在「每个 micro-batch 内部」算 InfoNCE（loss.py 的
+#   local_loss），梯度累积只是把梯度攒起来，不会让不同 micro-batch 互为负样本。
+#   也就是说累积能省显存、但换不来对比学习最看重的「更多批内负样本」，纯亏步数。
+#   要更多负样本应该直接加大 batch_size（显存允许的话）。
+accumulate_steps: 1
+epochs: 32                 # 118K 张 / 有效 batch 512 → 7,392 步。欠拟合可加到 64
+lr: 1.0e-4                 # 建议带小数点的科学计数法，避免被 YAML 解析成字符串
+# 学习率按 batch 缩放：原论文是 effective batch 32768 时用 5e-4。
+#   线性缩放 → 5e-4 × 512/32768 ≈ 7.8e-6（对 11.8 万张图来说太小，收敛太慢）
+#   开方缩放 → 5e-4 × √(512/32768) ≈ 6.3e-5
+#   这里取 1.0e-4：落在两者之间，也是 ViT 从零训练在 batch≈512 下的常用值。
+#   这是全套超参里最需要扫的一个 —— 建议先试 3.0e-4 / 1.0e-4 / 3.0e-5。
+warmup: 400                # ≈ 1.7 个 epoch，占总步数(7392)的 5.4%
 wd: 0.2
 beta1: 0.9
 beta2: 0.98                # 注意：原论文 0.98，非 torch 默认 0.999
 eps: 1.0e-6
-grad_clip_norm: null       # 不裁剪；需要时改成数值，如 1.0
+grad_clip_norm: null       # 不裁剪；若出现 loss 尖刺改成 1.0（train/main.py 已支持）
 
 # ---- 混合精度 ----
 no_amp: false              # 改成 true 可关闭 AMP（调试用）
 
 # ---- 日志与保存 ----
 output_dir: ./output
-save_freq: 1
+# 每 8 个 epoch 存一次。每个 checkpoint 要存模型 + AdamW 两个动量，ViT-B/32 下
+# 实测 1.7 GiB —— 每 epoch 都存的话，32 epoch 就是 54 GiB，而 output_dir 默认
+# 落在只有 30 GiB 的系统盘上，实测跑到 epoch 10 就把盘写满、torch.save 抛
+# "PytorchStreamWriter failed writing file data" 直接中断训练。
+# 每 8 个 epoch 存一次后，32 epoch 总共只产出 4 个文件（ep8/16/24/32）≈ 6.8 GiB。
+# 代价：崩盘时最坏要重跑 8 个 epoch（当前每 epoch 约 60s，即最多丢 8 分钟）。
+save_freq: 8
+# 滚动保留最近 N 个 checkpoint，更早的自动删除（None / 0 = 不清理）。
+# 与 save_freq 是两道独立的保险：save_freq 决定「多久存一次」（影响最多丢多少进度），
+# keep_last_n 决定「最多留几个」（决定磁盘占用上界，不随 epochs 增长）。
+keep_last_n: 3
 log_every: 10
-resume: null               # 断点续训：填 checkpoint 路径
+resume: null               # 断点续训：填 checkpoint 路径，例 ./output/checkpoint_ep10.pt
 
 # ---- 其它 ----
 seed: 0
