@@ -97,10 +97,8 @@ def main(cfg: DictConfig):
         model = dist_utils.wrap_ddp(model, args.local_rank)
 
     # 7) 构建数据集与 DataLoader
-    dataset = train_data.ImageTextDataset(
-        args.data_manifest,
-        transform=train_data.get_train_transform(args.image_size),
-    )
+    #    data_format 决定读 manifest 还是扁平目录（见 train/data.py 的 build_dataset）
+    dataset = train_data.build_dataset(args, split="train")
     train_loader, sampler = train_data.create_dataloader(
         dataset,
         batch_size=args.batch_size,
@@ -121,6 +119,8 @@ def main(cfg: DictConfig):
     if dist_utils.is_main_process():
         print("=" * 60)
         print(f"model            : {args.model}")
+        print(f"data_format      : {args.data_format}")
+        print(f"data             : {args.data_root or args.data_manifest}")
         print(f"world_size       : {world_size}")
         print(f"batch/GPU        : {args.batch_size}")
         print(f"accumulate_steps : {args.accumulate_steps}")

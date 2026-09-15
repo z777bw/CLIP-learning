@@ -16,6 +16,7 @@ OmegaConf：
 
 本文件封装了从 OmegaConf 的 ``DictConfig`` 到训练代码所用对象的转换与校验。
 """
+import os
 from types import SimpleNamespace
 
 from omegaconf import DictConfig, OmegaConf
@@ -53,13 +54,58 @@ def to_namespace(cfg: DictConfig) -> SimpleNamespace:
     return SimpleNamespace(**d)
 
 
+_DATA_FORMATS = ("manifest", "coco_flat")
+
+
+def resolve_data_format(args) -> str:
+    """确定数据格式；``data_format`` 留空时按「填了哪个路径」自动推断。
+
+    这样下面两条命令都能直接跑，不需要额外记一个开关：
+        train/main.py data_manifest=/path/train.jsonl      # JSONL 清单
+        train/main.py data_root=/path/to/coco_flat         # 扁平目录
+    """
+    fmt = getattr(args, "data_format", None)
+    if fmt:
+        return fmt
+    if getattr(args, "data_root", None):
+        return "coco_flat"
+    if getattr(args, "data_manifest", None):
+        return "manifest"
+    return "manifest"  # 两个路径都没填，交给 validate 报错
+
+
 def validate(args) -> None:
-    """必填项校验。"""
-    if not getattr(args, "data_manifest", None):
-        raise ValueError(
-            "缺少训练数据路径：请在配置文件里设置 data_manifest，"
-            "或用命令行覆盖 `data_manifest=/path/to/train.jsonl`。"
-        )
+    """必填项校验，并把推断出的 ``data_format`` 写回 ``args``。
+
+    写回是为了让下游（``train.data.build_dataset``）只处理确定的格式字符串，
+    不必重复实现一遍推断逻辑（``init_distributed_mode`` 也是同样的回填风格）。
+    """
+    fmt = resolve_data_format(args)
+    if fmt not in _DATA_FORMATS:
+        raise ValueError(f"未知的 data_format={fmt!r}，可选：{_DATA_FORMATS}")
+
+    if fmt == "manifest":
+        if not getattr(args, "data_manifest", None):
+            raise ValueError(
+                "缺少训练数据路径：请在配置文件里设置 data_manifest，"
+                "或用命令行覆盖 `data_manifest=/path/to/train.jsonl`；"
+                "也可改用扁平目录格式 `data_root=/path/to/dataset`。"
+            )
+    else:
+        root = getattr(args, "data_root", None)
+        if not root:
+            raise ValueError(
+                "缺少 data_root：请设置 `data_root=/path/to/dataset`"
+                "（目录下应有 train/ 与 test/ 子目录），"
+                "或用 `data_format=manifest` 配合 data_manifest。"
+            )
+        # 提前失败：validate 在 main.py 里远早于「构建模型 + 初始化 DDP」执行，
+        # 路径写错时不至于白白花掉几分钟的模型初始化再报错。
+        split_dir = os.path.join(root, "train")
+        if not os.path.isdir(split_dir):
+            raise ValueError(f"data_root 下找不到训练目录：{split_dir}")
+
+    args.data_format = fmt
 
 
 def print_config(cfg: DictConfig) -> None:

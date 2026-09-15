@@ -19,9 +19,16 @@ hydra:
 model: ViT-B/32            # RN50 / RN101 / ViT-B-32 / ViT-B-16 / ViT-L-14
 
 # ---- 数据 ----
-data_manifest: /path/to/your/train.jsonl   # 必填：改成你的 manifest 路径
+# data_format 选择数据布局，留空 (null) 时按下面填了哪个路径自动推断：
+#   manifest  : JSONL 清单，每行 {"image": path, "caption": text} → 用 data_manifest
+#   coco_flat : 扁平目录 <data_root>/<split>/s0000000.jpg + s0000000.txt（每行一句）
+data_format: null
+data_manifest: null        # data_format=manifest 时必填，例：/path/to/train.jsonl
+data_root: null            # 例：/root/autodl-tmp/wds_mscoco_captions2017
 image_size: 224
-workers: 8
+# 注意：本机 nproc=1（cgroup 配额 0.5 核），8 个 rank × workers 个进程共享 1 核，
+# 设太大会造成进程争抢，反而变慢。
+workers: 2
 
 # ---- 优化 ----
 batch_size: 256
