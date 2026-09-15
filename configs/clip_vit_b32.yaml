@@ -1,0 +1,48 @@
+# ============================================================================
+# CLIP 训练配置示例（ViT-B/32，对齐原论文）
+#
+# 由 Hydra 加载：main.py 里 @hydra.main(config_name="clip_vit_b32")
+#
+# 命令行覆盖用 key=value 语法（注意没有 -- 前缀），例如临时改 batch / lr：
+#     torchrun --nproc_per_node=8 train/main.py \
+#         batch_size=128 lr=1e-4 data_manifest=/path/to/train.jsonl
+#
+# 有效 batch = world_size(8) * batch_size(256) * accumulate_steps(16) = 32768
+# ============================================================================
+
+# ---- Hydra 运行时设置 ----
+hydra:
+  job:
+    chdir: false   # 保持 cwd 为仓库根目录，相对路径（data_manifest 等）才正确
+
+# ---- 模型 ----
+model: ViT-B/32            # RN50 / RN101 / ViT-B-32 / ViT-B-16 / ViT-L-14
+
+# ---- 数据 ----
+data_manifest: /path/to/your/train.jsonl   # 必填：改成你的 manifest 路径
+image_size: 224
+workers: 8
+
+# ---- 优化 ----
+batch_size: 256
+accumulate_steps: 16       # 与原论文 batch=32768 对齐（8 卡时）
+epochs: 32
+lr: 5.0e-4                 # 建议带小数点的科学计数法，避免被 YAML 解析成字符串
+warmup: 2000
+wd: 0.2
+beta1: 0.9
+beta2: 0.98                # 注意：原论文 0.98，非 torch 默认 0.999
+eps: 1.0e-6
+grad_clip_norm: null       # 不裁剪；需要时改成数值，如 1.0
+
+# ---- 混合精度 ----
+no_amp: false              # 改成 true 可关闭 AMP（调试用）
+
+# ---- 日志与保存 ----
+output_dir: ./output
+save_freq: 1
+log_every: 10
+resume: null               # 断点续训：填 checkpoint 路径
+
+# ---- 其它 ----
+seed: 0
