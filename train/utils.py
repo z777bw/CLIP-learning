@@ -187,7 +187,7 @@ def prune_checkpoints(output_dir, keep_last_n):
     return removed
 
 
-def save_checkpoint(args, model, optimizer, scaler, epoch, global_step, path):
+def save_checkpoint(model, optimizer, scaler, epoch, global_step, path, keep_last_n=None):
     """保存训练 checkpoint（只在主进程调用）。
 
     存的是「完整训练状态」而非只有模型参数，目的是断点续训后能精确接上：
@@ -198,8 +198,11 @@ def save_checkpoint(args, model, optimizer, scaler, epoch, global_step, path):
       * ``epoch`` / ``global_step`` —— 续训起点；global_step 同时是 lr 的唯一来源
 
     注意这里**没有 scheduler 状态**，因为本仓库根本没有 scheduler 对象：
-    ``optim.adjust_learning_rate`` 是 ``(global_step, args, total_steps)`` 的纯函数，
+    ``optim.adjust_learning_rate`` 是 ``(global_step, cfg, total_steps)`` 的纯函数，
     只要 global_step 存对了，lr 就能原样重算出来。
+
+    也**不存配置 cfg**：DictConfig 无法被 pickle，而且断点续训时配置由 Hydra
+    从 YAML + 命令行重新加载，无需从 checkpoint 恢复。
 
     Args:
         model:      可能是 DDP 包裹的模型，需要取其 .module 得到原始模型再存
@@ -208,6 +211,7 @@ def save_checkpoint(args, model, optimizer, scaler, epoch, global_step, path):
         epoch:      当前 epoch（从 0 开始）
         global_step: 已完成的优化步数
         path:       保存路径
+        keep_last_n: 滚动保留最近几个 checkpoint，None / <=0 表示不清理
     """
     # 去掉 DDP 的 "module." 前缀，保存干净的 state_dict
     state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -218,7 +222,6 @@ def save_checkpoint(args, model, optimizer, scaler, epoch, global_step, path):
         "scaler": scaler.state_dict() if scaler is not None else None,
         "epoch": epoch,
         "global_step": global_step,
-        "args": args,
     }
 
     # 先写临时文件再原子替换，避免保存中途被 kill / 写满磁盘导致 checkpoint 损坏
@@ -237,10 +240,9 @@ def save_checkpoint(args, model, optimizer, scaler, epoch, global_step, path):
 
     # 保存成功之后再清理旧的（顺序不能反：万一本步保存失败，
     # 老的 checkpoint 还在，不至于两头落空）
-    keep = getattr(args, "keep_last_n", None)
-    removed = prune_checkpoints(os.path.dirname(path) or ".", keep)
+    removed = prune_checkpoints(os.path.dirname(path) or ".", keep_last_n)
     if removed:
-        print(f"[checkpoint] 清理旧 checkpoint（保留最近 {keep} 个）："
+        print(f"[checkpoint] 清理旧 checkpoint（保留最近 {keep_last_n} 个）："
               f"{', '.join(removed)}")
 
 
@@ -256,10 +258,8 @@ def load_checkpoint(path, model, optimizer=None, scaler=None):
         optimizer / scaler: 可选，加载其状态以支持断点续训
     """
     # torch>=2.6 的 torch.load 默认 weights_only=True，只允许反序列化张量和
-    # 基本类型；而本 checkpoint 里存了 args（SimpleNamespace），不在白名单内，
-    # 会直接抛 UnpicklingError: "Weights only load failed"。实测除了 args 之外
-    # 的字段都能安全加载，唯独它把整条续训路径毒死。
-    # 这是本进程自己刚写出来的文件，来源可信，显式关掉。
+    # 基本类型。新格式的 checkpoint 已不再存配置对象（早期版本曾存过 args），
+    # 但为兼容旧文件、也因为是本进程自己写出的可信文件，显式关掉该限制。
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
     # 兼容两种保存格式：旧格式直接是 state_dict，新格式是 dict

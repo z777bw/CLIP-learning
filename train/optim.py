@@ -110,7 +110,7 @@ class CLIPWrapper(nn.Module):
         return image_features, text_features, self.clip.logit_scale
 
 
-def create_optimizer(model: nn.Module, args) -> torch.optim.Optimizer:
+def create_optimizer(model: nn.Module, cfg) -> torch.optim.Optimizer:
     """创建 AdamW 优化器，并对不同参数分组施加不同的权重衰减。
 
     分组规则（常见最佳实践）：
@@ -136,38 +136,38 @@ def create_optimizer(model: nn.Module, args) -> torch.optim.Optimizer:
             decay.append(p)
 
     param_groups = [
-        {"params": decay, "weight_decay": args.wd},
+        {"params": decay, "weight_decay": cfg.wd},
         {"params": no_decay, "weight_decay": 0.0},
     ]
 
     optimizer = torch.optim.AdamW(
         param_groups,
-        lr=args.lr,
-        betas=(args.beta1, args.beta2),  # 原论文 (0.9, 0.98)
-        eps=args.eps,                    # 原论文 1e-6
+        lr=cfg.lr,
+        betas=(cfg.beta1, cfg.beta2),  # 原论文 (0.9, 0.98)
+        eps=cfg.eps,                    # 原论文 1e-6
     )
     return optimizer
 
 
-def adjust_learning_rate(optimizer, step: int, args, total_steps: int) -> float:
+def adjust_learning_rate(optimizer, step: int, cfg, total_steps: int) -> float:
     """按当前「优化器步数」计算并设置学习率：warmup 线性上升 + cosine 衰减。
 
     Args:
         optimizer:   优化器
         step:        当前全局优化步数（从 0 开始，每走一个有效 batch 加 1）
-        args:        参数命名空间，包含 lr / warmup
+        cfg:         训练配置（DictConfig），包含 lr / warmup
         total_steps: 总的优化步数（用于 cosine 进度归一化）
 
     Returns:
         当前步设置的学习率。
     """
-    if step < args.warmup:
+    if step < cfg.warmup:
         # 线性 warmup：从 0 线性增长到 base_lr
-        lr = args.lr * (step + 1) / max(1, args.warmup)
+        lr = cfg.lr * (step + 1) / max(1, cfg.warmup)
     else:
         # cosine 衰减：从 base_lr 平滑降到 0
-        progress = (step - args.warmup) / max(1, total_steps - args.warmup)
-        lr = args.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+        progress = (step - cfg.warmup) / max(1, total_steps - cfg.warmup)
+        lr = cfg.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr

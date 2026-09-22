@@ -81,8 +81,8 @@ def setup_for_distributed(is_master: bool):
     __builtin__.print = print
 
 
-def init_distributed_mode(args):
-    """初始化分布式进程组，并把当前进程绑定到正确的 GPU。
+def init_distributed_mode(cfg):
+    """初始化分布式进程组，并把运行时信息写回 ``cfg``。
 
     依赖的环境变量（由 torchrun 自动注入）：
         MASTER_ADDR / MASTER_PORT : 主节点地址与端口
@@ -92,30 +92,35 @@ def init_distributed_mode(args):
 
     当检测不到 RANK / WORLD_SIZE 时（例如直接 `python train.py` 单卡调试），
     自动退化为单进程模式，方便在本地快速跑通逻辑。
+
+    注意：会向 ``cfg`` 写入 rank / world_size / local_rank / distributed 四个
+    运行时字段，因此调用前需保证 cfg 可写（``OmegaConf.set_struct(cfg, False)``，
+    见 main.py）。这几个值本质是「本次运行的环境信息」而非「模型超参数」，
+    写到 cfg 里只是为了和超参数走同一份传递路径，省去额外的返回值。
     """
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        args.distributed = True
+        cfg.rank = int(os.environ["RANK"])
+        cfg.world_size = int(os.environ["WORLD_SIZE"])
+        cfg.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        cfg.distributed = True
 
         # env:// 会自动读取 MASTER_ADDR / MASTER_PORT / RANK / WORLD_SIZE
         dist.init_process_group(backend="nccl", init_method="env://")
-        torch.cuda.set_device(args.local_rank)
+        torch.cuda.set_device(cfg.local_rank)
         print(
-            f"[init] distributed training: world_size={args.world_size}, "
-            f"rank={args.rank}, local_rank={args.local_rank}"
+            f"[init] distributed training: world_size={cfg.world_size}, "
+            f"rank={cfg.rank}, local_rank={cfg.local_rank}"
         )
     else:
-        args.rank = 0
-        args.world_size = 1
-        args.local_rank = 0
-        args.distributed = False
+        cfg.rank = 0
+        cfg.world_size = 1
+        cfg.local_rank = 0
+        cfg.distributed = False
         print("[init] not using distributed mode (single process)")
         return
 
     # 非主进程静默
-    setup_for_distributed(args.rank == 0)
+    setup_for_distributed(cfg.rank == 0)
 
 
 def wrap_ddp(model: torch.nn.Module, device: int) -> torch.nn.Module:

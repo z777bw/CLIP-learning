@@ -302,25 +302,25 @@ def create_dataloader(
     return loader, sampler
 
 
-def build_dataset(args, split="train"):
-    """按 ``args.data_format`` 构建训练数据集（换数据格式只需改这一处）。
+def build_dataset(cfg, split="train"):
+    """按 ``cfg.data_format`` 构建训练数据集（换数据格式只需改这一处）。
 
     Args:
-        args:  训练配置（需含 data_format、image_size，以及对应格式的路径字段）
+        cfg:   训练配置（DictConfig），需含 data_format、image_size 及对应格式的路径字段
         split: 子目录名，仅 coco_flat 格式使用；manifest 是单文件，忽略该参数
 
     ``data_format`` 的具体取值由 ``train.config.validate`` 推断并写回，
     所以这里只会看到确定的字符串。
     """
-    fmt = getattr(args, "data_format", None)
-    transform = get_train_transform(args.image_size)
+    fmt = cfg.data_format
+    transform = get_train_transform(cfg.image_size)
 
     if fmt == "manifest":
-        return ImageTextDataset(args.data_manifest, transform=transform)
+        return ImageTextDataset(cfg.data_manifest, transform=transform)
 
     if fmt == "coco_flat":
         return CocoFlatDataset(
-            args.data_root, split=split, transform=transform
+            cfg.data_root, split=split, transform=transform
         )
 
     raise ValueError(

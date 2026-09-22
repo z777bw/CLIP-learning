@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """CLIP 分布式训练主入口。
 
-本文件是整个训练流程的「编排层」：解析参数 → 初始化分布式环境 → 构建
-模型/数据/优化器 → 混合精度训练循环 → 定期保存 checkpoint。
+本文件是整个训练流程的「编排层」：加载配置（Hydra）→ 初始化分布式环境 →
+构建模型/数据/优化器 → 混合精度训练循环 → 定期保存 checkpoint。
 
 运行方式（推荐用 torchrun，见仓库根目录 run_train.sh）：
     torchrun --nproc_per_node=8 --nnodes=1 train/main.py
@@ -14,13 +14,12 @@
 关键训练要点（均对齐 CLIP 原论文）：
   * 对比学习 InfoNCE 损失，可学习温度 logit_scale（初值 ln(1/0.07)）；
   * AdamW（β1=0.9, β2=0.98, ε=1e-6, wd=0.2）；
-  * cosine 学习率 + 2000 步 warmup；
+  * cosine 学习率 + warmup；
   * 大有效 batch（论文 32768）通过「多卡 + 梯度累积」组合达到；
   * 混合精度训练（PyTorch 原生 AMP，等价于原论文的 APEX O2）。
 
 有效 batch 计算方式：
     effective_batch = world_size * batch_size * accumulate_steps
-例如 8 卡 × 256 × 16 = 32768，与论文一致。
 """
 import os
 import sys
@@ -51,63 +50,67 @@ from train import utils as train_utils
 
 @hydra.main(version_base=None, config_path="../configs", config_name="clip_vit_b32")
 def main(cfg: DictConfig):
-    # 超参数：Hydra 加载 YAML + 命令行 key=value 覆盖，见 train/config.py
-    args = train_config.to_namespace(cfg)
-    train_config.validate(args)
+    # Hydra 的 cfg 默认 struct=True（禁止添加新字段），这里打开写入能力：
+    # 后续 validate 要写回 data_format，init_distributed_mode 要写回
+    # rank / world_size / local_rank / distributed 等运行时信息。
+    OmegaConf.set_struct(cfg, False)
 
-    # 1) 初始化分布式环境（读取 torchrun 注入的环境变量，绑定 GPU）
-    dist_utils.init_distributed_mode(args)
+    # 校验必填项，并推断/写回 data_format（见 train/config.py）
+    train_config.validate(cfg)
+
+    # 1) 初始化分布式环境（往 cfg 写回 rank/world_size/local_rank/distributed）
+    dist_utils.init_distributed_mode(cfg)
 
     # 打印最终生效配置（仅主进程，便于复现实验）
     if dist_utils.is_main_process():
         train_config.print_config(cfg)
 
     device = torch.device(
-        f"cuda:{args.local_rank}" if args.distributed else "cuda"
+        f"cuda:{cfg.local_rank}" if cfg.distributed else "cuda"
     )
-    world_size = args.world_size
-    rank = args.rank
+    world_size = cfg.world_size
+    rank = cfg.rank
 
     # 设置随机种子：为保证各卡模型初始化一致，用同一个 seed
-    torch.manual_seed(args.seed)
+    torch.manual_seed(cfg.seed)
 
     # 2) 构建模型：官方 CLIP → 包装成返回特征的 wrapper → DDP
-    raw_model = train_optim.build_clip_model(args.model)
+    raw_model = train_optim.build_clip_model(cfg.model)
     model = train_optim.CLIPWrapper(raw_model)
     model = model.to(device)
 
     # 3) 构建优化器（在加载 checkpoint 之前，方便加载 optimizer 状态）
-    optimizer = train_optim.create_optimizer(model, args)
+    optimizer = train_optim.create_optimizer(model, cfg)
 
     # 4) AMP：GradScaler 用于混合精度下防止梯度下溢
     #    用 torch.amp.GradScaler("cuda", ...) 这种新写法：torch>=2.4 起
     #    torch.cuda.amp.GradScaler 已废弃，torch 2.6 下每次运行都会刷
     #    FutureWarning 到 stderr，把训练日志冲得很难看。
-    use_amp = (not args.no_amp) and torch.cuda.is_available()
+    use_amp = (not cfg.no_amp) and torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # 5) 断点续训：加载 checkpoint（在 DDP 包装之前，避免 "module." 前缀问题）
     start_epoch = 0
     global_step = 0
-    if args.resume is not None:
+    if cfg.resume is not None:
         start_epoch, global_step = train_utils.load_checkpoint(
-            args.resume, model, optimizer, scaler
+            cfg.resume, model, optimizer, scaler
         )
         # 续训时从「下一个 epoch」继续
         start_epoch += 1
 
     # 6) 包装成 DDP（必须在加载完 checkpoint、模型 .to(device) 之后）
-    if args.distributed:
-        model = dist_utils.wrap_ddp(model, args.local_rank)
+    if cfg.distributed:
+        model = dist_utils.wrap_ddp(model, cfg.local_rank)
 
     # 7) 构建数据集与 DataLoader
     #    data_format 决定读 manifest 还是扁平目录（见 train/data.py 的 build_dataset）
-    dataset = train_data.build_dataset(args, split="train")
+    dataset = train_data.build_dataset(cfg, split="train")
     train_loader, sampler = train_data.create_dataloader(
         dataset,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        distributed=args.distributed,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.workers,
+        distributed=cfg.distributed,
         rank=rank,
         world_size=world_size,
     )
@@ -115,18 +118,18 @@ def main(cfg: DictConfig):
     # 计算总优化步数：用于 cosine 学习率调度的归一化
     # 每个 rank 的 batch 数（drop_last 后各卡相等）
     num_batches_per_epoch = len(train_loader)
-    steps_per_epoch = num_batches_per_epoch // args.accumulate_steps
-    total_steps = steps_per_epoch * args.epochs
-    # 梯度累积后的有效 batch（与原论文 32768 对齐）
-    effective_batch = world_size * args.batch_size * args.accumulate_steps
+    steps_per_epoch = num_batches_per_epoch // cfg.accumulate_steps
+    total_steps = steps_per_epoch * cfg.epochs
+    # 梯度累积后的有效 batch
+    effective_batch = world_size * cfg.batch_size * cfg.accumulate_steps
 
     summary_lines = [
-        f"model            : {args.model}",
-        f"data_format      : {args.data_format}",
-        f"data             : {args.data_root or args.data_manifest}",
+        f"model            : {cfg.model}",
+        f"data_format      : {cfg.data_format}",
+        f"data             : {cfg.data_root or cfg.data_manifest}",
         f"world_size       : {world_size}",
-        f"batch/GPU        : {args.batch_size}",
-        f"accumulate_steps : {args.accumulate_steps}",
+        f"batch/GPU        : {cfg.batch_size}",
+        f"accumulate_steps : {cfg.accumulate_steps}",
         f"effective_batch  : {effective_batch}",
         f"dataset size     : {len(dataset)}",
         f"batches/epoch    : {num_batches_per_epoch}",
@@ -140,18 +143,18 @@ def main(cfg: DictConfig):
             print(line)
         print("=" * 60)
 
-    # 9) 训练日志：train.log（人类可读）+ metrics.csv（可直接画曲线）
+    # 8) 训练日志：train.log（人类可读）+ metrics.csv（可直接画曲线）
     #    只在主进程真正写文件，其余 rank 得到一个空操作的 logger
     logger = train_utils.TrainLogger(
-        args.output_dir, enabled=dist_utils.is_main_process()
+        cfg.output_dir, enabled=dist_utils.is_main_process()
     )
     logger.log_run_header(
-        OmegaConf.to_yaml(cfg, resolve=True), summary_lines, resume=args.resume
+        OmegaConf.to_yaml(cfg, resolve=True), summary_lines, resume=cfg.resume
     )
 
-    # 10) 训练循环
+    # 9) 训练循环
     model.train()
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, cfg.epochs):
         # 每个 epoch 重新洗牌，保证各卡采样顺序不同且随机（分布式关键）
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -162,7 +165,7 @@ def main(cfg: DictConfig):
             optimizer=optimizer,
             scaler=scaler,
             device=device,
-            args=args,
+            cfg=cfg,
             epoch=epoch,
             global_step=global_step,
             total_steps=total_steps,
@@ -175,14 +178,15 @@ def main(cfg: DictConfig):
         # 定期保存 checkpoint（仅主进程）
         # 最后一个 epoch 无条件保存：否则当 epochs 不是 save_freq 的整数倍时
         # （例 epochs=30 + save_freq=8 → 只在 8/16/24 存），训练跑完却拿不到
-        # 最终模型，前面全白训。当前 32 % 8 == 0 恰好命中，但改 epochs 就会踩。
-        is_final_epoch = (epoch + 1) == args.epochs
+        # 最终模型，前面全白训。
+        is_final_epoch = (epoch + 1) == cfg.epochs
         if (dist_utils.is_main_process()
-                and ((epoch + 1) % args.save_freq == 0 or is_final_epoch)):
-            ckpt_path = os.path.join(args.output_dir, f"checkpoint_ep{epoch + 1}.pt")
+                and ((epoch + 1) % cfg.save_freq == 0 or is_final_epoch)):
+            ckpt_path = os.path.join(cfg.output_dir, f"checkpoint_ep{epoch + 1}.pt")
             # 保存前先取回原始模型（去掉 DDP 包装）
             train_utils.save_checkpoint(
-                args, model, optimizer, scaler, epoch, global_step, ckpt_path
+                model, optimizer, scaler, epoch, global_step, ckpt_path,
+                keep_last_n=cfg.keep_last_n,
             )
             # save_checkpoint 自己会打印到控制台，这里只补一条文件记录，避免重复刷屏
             logger.log_message(
@@ -198,7 +202,7 @@ def main(cfg: DictConfig):
 
 
 def train_one_epoch(
-    model, loader, optimizer, scaler, device, args, epoch, global_step,
+    model, loader, optimizer, scaler, device, cfg, epoch, global_step,
     total_steps, use_amp, rank, world_size, logger,
 ):
     """训练一个 epoch，返回 (该 epoch 的全局平均 loss, 更新后的 global_step)。"""
@@ -207,15 +211,10 @@ def train_one_epoch(
     # 两个累加器，职责不同，不要混用：
     #   window_*  只统计「距上次打日志以来」的窗口，用于实时展示；
     #   epoch_*   统计整个 epoch（不被打日志重置），用于 epoch 结束时的真实平均 loss。
-    # 旧实现只有一个累加器且在打日志时清零，于是 epoch 末尾算出的「平均」其实
-    # 只是「最后一次打日志之后的平均」，并不是整个 epoch 的。
     window_loss, window_count = 0.0, 0
     epoch_loss_sum, epoch_count = 0.0, 0
 
     # 吞吐统计的「窗口」：只数距上次打日志以来处理了多少样本、过了多久。
-    # 不能拿全局 global_step 除以「本 epoch 已耗时」—— 分母每换一个 epoch 就归零，
-    # 分子却是跨 epoch 的累计值，于是每个 epoch 开头都会飙出一个假的高吞吐
-    # （实测 1980 samples/s → 161110 samples/s，这种数字会误导对瓶颈的判断）。
     window_samples = 0
     last_log_time = time.time()
 
@@ -224,8 +223,7 @@ def train_one_epoch(
     epoch_start = time.time()
 
     # 进度条只在主进程渲染（其余 rank disable=True，既不输出也不做终端控制）
-    # leave=False：每个 epoch 结束后进度条自行消失，只留下下面那行 epoch 汇总，
-    # 避免 32 个 epoch 的进度条在终端里堆成一片。
+    # leave=False：每个 epoch 结束后进度条自行消失，只留下下面那行 epoch 汇总。
     bar = tqdm(
         total=len(loader),
         desc=f"epoch {epoch}",
@@ -253,25 +251,25 @@ def train_one_epoch(
                 local_loss=True,
             )
             # 梯度累积：把 loss 平均到每个累积步上
-            loss = loss / args.accumulate_steps
+            loss = loss / cfg.accumulate_steps
 
         # ---- 反向传播（scaler 处理 fp16 下溢）----
         scaler.scale(loss).backward()
 
         # 记录 loss（乘回 accumulate_steps 得到真实单步 loss）
-        step_loss = loss.item() * args.accumulate_steps
+        step_loss = loss.item() * cfg.accumulate_steps
         window_loss += step_loss
         window_count += 1
         epoch_loss_sum += step_loss
         epoch_count += 1
 
         # ---- 每 accumulate_steps 步更新一次参数 ----
-        if (step + 1) % args.accumulate_steps == 0:
+        if (step + 1) % cfg.accumulate_steps == 0:
             # 梯度裁剪（可选）
-            if args.grad_clip_norm is not None:
+            if cfg.grad_clip_norm is not None:
                 scaler.unscale_(optimizer)
                 torch_nn_utils.clip_grad_norm_(
-                    model.parameters(), args.grad_clip_norm
+                    model.parameters(), cfg.grad_clip_norm
                 )
 
             scaler.step(optimizer)
@@ -281,16 +279,16 @@ def train_one_epoch(
 
             # 更新学习率（按全局优化步数 warmup + cosine）
             lr = train_optim.adjust_learning_rate(
-                optimizer, global_step, args, total_steps
+                optimizer, global_step, cfg, total_steps
             )
             global_step += 1
-            window_samples += world_size * args.batch_size * args.accumulate_steps
+            window_samples += world_size * cfg.batch_size * cfg.accumulate_steps
 
-            if global_step % args.log_every == 0:
+            if global_step % cfg.log_every == 0:
                 # 注意：all_reduce 是集合通信，每个 rank 都必须调用。
                 # 这里绝不能写成 `if is_main and ...:` —— 那样只有 rank 0 进入
                 # 通信，其余 rank 直接跳过，rank 0 会在 all_reduce 上永久阻塞
-                # 直到 NCCL 超时。多卡训练里「日志相关的 hang」基本都是这个原因。
+                # 直到 NCCL 超时。
                 global_avg_loss = dist_utils.all_reduce_mean(
                     torch.tensor(window_loss / max(1, window_count), device=device)
                 )
@@ -321,7 +319,7 @@ def train_one_epoch(
     )
 
     epoch_elapsed = time.time() - epoch_start
-    samples_per_epoch = epoch_count * world_size * args.batch_size * args.accumulate_steps
+    samples_per_epoch = epoch_count * world_size * cfg.batch_size * cfg.accumulate_steps
     logger.log_epoch(epoch, epoch_avg_loss,
                      samples_per_epoch / max(epoch_elapsed, 1e-9),
                      epoch_elapsed, lr)
