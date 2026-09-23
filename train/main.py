@@ -50,11 +50,9 @@ from train import utils as train_utils
 
 @hydra.main(version_base=None, config_path="../configs", config_name="clip_vit_b32")
 def main(cfg: DictConfig):
-    # Hydra 的 cfg 默认 struct=True（禁止添加新字段），这里打开写入能力：
-    # 后续 validate 要写回 data_format，init_distributed_mode 要写回
     # rank / world_size / local_rank / distributed 等运行时信息。
-    OmegaConf.set_struct(cfg, False)
-
+    OmegaConf.set_struct(cfg, False) # Hydra 的 cfg 默认 struct=True(禁止添加新字段), 打开写入
+ 
     # 校验必填项，并推断/写回 data_format（见 train/config.py）
     train_config.validate(cfg)
 

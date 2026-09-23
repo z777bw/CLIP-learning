@@ -105,7 +105,7 @@ def init_distributed_mode(cfg):
         cfg.distributed = True
 
         # env:// 会自动读取 MASTER_ADDR / MASTER_PORT / RANK / WORLD_SIZE
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://") # 组网建立连接
         torch.cuda.set_device(cfg.local_rank)
         print(
             f"[init] distributed training: world_size={cfg.world_size}, "
