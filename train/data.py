@@ -140,7 +140,7 @@ def _scan_split_stems(split_dir: str):
             f"caption、{len(only_caption)} 个 caption 缺图片，已忽略这些样本"
         )
 
-    return sorted(stems_with_image & stems_with_caption)
+    return sorted(stems_with_image & stems_with_caption) # 取集合交集
 
 
 class CocoFlatDataset(Dataset):
@@ -195,19 +195,12 @@ class CocoFlatDataset(Dataset):
 
     def __getitem__(self, idx):
         image_path = os.path.join(self.dir, self.stems[idx] + _IMAGE_SUFFIX)
-        # with 确保长跑的 worker 进程不会泄漏文件描述符
-        with Image.open(image_path) as im:
+        with Image.open(image_path) as im: # 读取自动关闭文件
             # 数据集里有少量灰度图（实测约 1/800），必须转 RGB，否则
             # Normalize 前通道数对不上。
             image = self.transform(im.convert("RGB"))
 
-        # 用模块级 random.choice，不要用 random.Random(seed ^ idx)：
-        # DataLoader 会给每个 worker 用 base_seed + worker_id 播种 Python 的
-        # random 全局状态，所以这里天然是 worker 安全的；而且 persistent_workers
-        # 下 worker 的随机状态跨 epoch 持续推进，同一 idx 在不同 epoch 会取到
-        # 不同 caption。若按 idx 定种，(图片, caption) 就成了 idx 的固定函数，
-        # 每个 epoch 都取到同一句，随机增强的效果就没了。
-        caption = random.choice(self.read_captions(idx))
+        caption = random.choice(self.read_captions(idx)) # 随机抽取一个 caption
         # truncate=True 是兜底：清洗过后全量数据已无超长 caption，但万一以后
         # 换数据又混进脏样本，宁可截断也不该让整轮多卡训练中途崩掉。
         text = self.tokenizer(caption, truncate=True)[0]
